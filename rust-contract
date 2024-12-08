@@ -1,0 +1,164 @@
+
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Transfer, TokenAccount, Token};
+use solana_program::sysvar::clock::Clock;
+use solana_program::sysvar::recent_blockhashes;
+use solana_program::hash::hash;
+use solana_program::{program::invoke, instruction::Instruction};
+
+declare_id!("YourProgramIDHere");
+
+#[program]
+pub mod raffle_game {
+    use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>, owner: Pubkey, prize_wallet: Pubkey) -> Result<()> {
+        let game = &mut ctx.accounts.game;
+        game.owner = owner;
+        game.prize_wallet = prize_wallet;
+        game.ticket_count = 0;
+        game.is_active = false;
+        game.game_id = 0; // Game starts at ID 0
+        Ok(())
+    }
+
+    pub fn start_game(ctx: Context<StartGame>) -> Result<()> {
+        let game = &mut ctx.accounts.game;
+        require!(ctx.accounts.user.key == &game.owner, GameError::Unauthorized);
+        game.is_active = true;
+        Ok(())
+    }
+
+    pub fn buy_ticket(ctx: Context<BuyTicket>, amount: u64) -> Result<()> {
+        let game = &mut ctx.accounts.game;
+
+        // Validate game conditions
+        require!(game.is_active, GameError::GameNotActive);
+        require!(game.ticket_count < 50, GameError::TicketsSoldOut);
+        require!(amount == 2_000_000, GameError::IncorrectAmount); // Ticket price is 2 tokens with 6 decimal places
+
+        // Increment the ticket count and add the participant
+        game.ticket_count += 1;
+        game.participants.push(*ctx.accounts.user.key);
+
+        // Get current timestamp from Solana Clock sysvar
+        let clock = Clock::get().unwrap();
+        let unix_timestamp = clock.unix_timestamp;
+
+        // Create a memo with the game info (game number and timestamp)
+        let memo_message = format!("Game {} | Timestamp: {} | Ticket {}", game.game_id, unix_timestamp, game.ticket_count);
+        let memo_instruction = Instruction {
+            program_id: sysvar::memo::id(),
+            accounts: vec![],
+            data: memo_message.as_bytes().to_vec(),
+        };
+        invoke(
+            &memo_instruction,
+            &[
+                ctx.accounts.user.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+
+        // If all tickets are sold, determine a winner, distribute prizes, and start a new game
+        if game.ticket_count == 50 {
+            select_winner_and_distribute_prizes(ctx)?;
+            game.game_id += 1; 
+            game.ticket_count = 0;
+            game.participants.clear();
+            game.is_active = true; 
+        }
+
+        Ok(())
+    }
+
+    fn select_winner_and_distribute_prizes(ctx: Context<BuyTicket>) -> Result<()> {
+        let game = &ctx.accounts.game;
+
+        // Use a pseudo-random winner selection (better to use Chainlink VRF for true randomness)
+        let block_hash = ctx.accounts.sysvar_recent_blockhashes.last().unwrap().blockhash;
+        let hash_value = hash(block_hash.as_ref());
+        let winner_index = (hash_value.as_ref()[0] as usize) % game.participants.len();
+        let winner_pubkey = game.participants[winner_index];
+
+        // Calculate prize split
+        let total_amount = ctx.accounts.token_account.amount;
+        let prize_amount = total_amount / 2;
+        let owner_amount = total_amount - prize_amount;
+
+        // Transfer prize to the winner
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.token_account.to_account_info(),
+            to: ctx.accounts.winner_wallet.to_account_info(),
+            authority: ctx.accounts.user.to_account_info(),
+        };
+        let cpi_context = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+        token::transfer(cpi_context, prize_amount)?;
+
+        // Transfer the rest of the funds to the owner's wallet
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.token_account.to_account_info(),
+            to: ctx.accounts.owner_wallet.to_account_info(),
+            authority: ctx.accounts.user.to_account_info(),
+        };
+        let cpi_context = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+        token::transfer(cpi_context, owner_amount)?;
+
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(init, payer = user, space = 8 + 32 + 32 + 1 + 8 + 4 + 1000)] // Storage for participants, ticket count, etc.
+    pub game: Account<'info, GameState>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct StartGame<'info> {
+    #[account(mut)]
+    pub game: Account<'info, GameState>,
+    #[account(signer)]
+    pub user: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct BuyTicket<'info> {
+    #[account(mut)]
+    pub game: Account<'info, GameState>,
+    #[account(mut)]
+    pub token_account: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+    #[account(signer)]
+    pub user: Signer<'info>,
+    #[account(mut)]
+    pub winner_wallet: AccountInfo<'info>,
+    #[account(mut)]
+    pub owner_wallet: AccountInfo<'info>,
+    pub sysvar_recent_blockhashes: Sysvar<'info, RecentBlockhashes>,
+}
+
+#[account]
+pub struct GameState {
+    pub owner: Pubkey,
+    pub prize_wallet: Pubkey,
+    pub ticket_count: u8,
+    pub is_active: bool,
+    pub participants: Vec<Pubkey>, // Store participant public keys
+    pub game_id: u32, // Track the current game ID
+}
+
+#[error_code]
+pub enum GameError {
+    #[msg("The game is not currently active.")]
+    GameNotActive,
+    #[msg("All tickets have been sold.")]
+    TicketsSoldOut,
+    #[msg("Incorrect ticket amount.")]
+    IncorrectAmount,
+    #[msg("Unauthorized action.")]
+    Unauthorized,
+}
